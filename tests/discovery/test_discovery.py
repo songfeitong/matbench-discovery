@@ -520,9 +520,10 @@ def test_relaxation_settings_load_yaml_and_overrides(
     assert RelaxationSettings(cell_filter="NONE") == RelaxationSettings(
         cell_filter=None
     )
-    # only the EMT debug calculator may lack a model YAML
+    # Registered local calculators may lack a leaderboard model YAML.
     assert RelaxationSettings.from_model("emt") == RelaxationSettings()
-    with pytest.raises(ValueError, match="'not-a-model' not found in Model enum"):
+    assert RelaxationSettings.from_model("prophetv2_local") == RelaxationSettings()
+    with pytest.raises(ValueError, match="Unknown model"):
         RelaxationSettings.from_model("not-a-model")
 
 

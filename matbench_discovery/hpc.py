@@ -29,7 +29,15 @@ COST_SOURCES: Final = ("runner", "salvaged", "author_reported")
 YAML_ONLY_COST_SOURCES: Final = ("salvaged", "author_reported")
 # where the timed work ran: merged units must agree on each, and resumed work must
 # match the sessions before it (plus their package versions)
-RUN_LABEL_KEYS: Final = ("hardware", "device", "dtype", "acceleration", "backend")
+RUN_LABEL_KEYS: Final = (
+    "hardware",
+    "device",
+    "dtype",
+    "acceleration",
+    "backend",
+    "checkpoint_sha256",
+    "matmul_precision",
+)
 # the YAML `cost: {...}` mapping next to a task artifact, in canonical order. Flat
 # artifact run metadata spells its source key cost_source
 COST_KEYS: Final = (
@@ -513,6 +521,14 @@ def merge_audit_metadata(
             missing (not one reproducible prediction set).
     """
     merged: dict[str, object] = {}
+    for key in ("checkpoint_sha256", "matmul_precision"):
+        values = [unit.get(key) for unit in units]
+        if (
+            strict
+            and any(value is not None for value in values)
+            and _uniform_label(values) is None
+        ):
+            raise ValueError(f"Run units contain mixed or missing {key}")
     versions = [unit.get("versions") for unit in units]
     if all(isinstance(value, dict) for value in versions) and (
         uniform_versions := _uniform_label(versions)

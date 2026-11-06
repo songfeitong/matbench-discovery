@@ -26,8 +26,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+import math
 import os
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -49,6 +52,7 @@ from matbench_discovery.discovery import (
     ARCHIVED_DISCOVERY_MODELS,
     DISCOVERY_PRED_COL,
     DiscoveryArtifacts,
+    MergedDiscoveryRun,
     RelaxationSettings,
     dry_run_settings,
     load_wbm_atoms,
@@ -91,6 +95,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--geo-opt-file", help="Override the final relaxed-structure JSONL path"
     )
     parser.add_argument("--max-force", type=float)
+    parser.add_argument("--checkpoint", help="Explicit local calculator checkpoint")
+    parser.add_argument(
+        "--material-ids",
+        type=Path,
+        help="Fixed nonempty subset: one canonical WBM material ID per line",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        choices=("highest", "high"),
+        help="Explicit torch FP32 matmul policy, recorded for resume and merge",
+    )
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--ase-optimizer")
     parser.add_argument(
@@ -139,6 +154,9 @@ def _print_cmd_args(args: argparse.Namespace, model_key: str) -> list[str]:
         model_key,
         {
             "dtype": args.dtype,
+            "checkpoint": args.checkpoint,
+            "material-ids": args.material_ids,
+            "matmul-precision": args.matmul_precision,
             "device": args.device,
             "out-dir": args.out_dir,
             "shard-dir": args.shard_dir,
@@ -153,6 +171,69 @@ def _print_cmd_args(args: argparse.Namespace, model_key: str) -> list[str]:
         },
         ("dry-run", "merge-shards", "write-yaml", "replace-author-reported"),
     )
+
+
+def read_material_ids(path: Path | None) -> list[str] | None:
+    """Read a fixed material selection without silently removing duplicates."""
+    if path is None:
+        return None
+    ids = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    if not ids or len(ids) != len(set(ids)):
+        raise ValueError("Selected material IDs must be nonempty and unique")
+    return ids
+
+
+def write_local_metrics(
+    artifacts: DiscoveryArtifacts,
+    merged_run: MergedDiscoveryRun,
+    output_dir: str,
+    *,
+    subset: bool,
+) -> str:
+    """Score precisely the merged coverage using official cleaning and metrics."""
+    from matbench_discovery import STABILITY_THRESHOLD, atomic_output_path
+    from matbench_discovery.data import df_wbm
+    from matbench_discovery.enums import MbdKey, TestSubset
+    from matbench_discovery.metrics import discovery as metric_functions
+
+    ids = [record.material_id for record in merged_run.records]
+    reference = df_wbm.loc[ids]
+    metric_reference, predictions = metric_functions.prepare_model_predictions(
+        reference, artifacts.predictions[DISCOVERY_PRED_COL]
+    )
+    unique_reference = reference.loc[reference[MbdKey.uniq_proto].astype(bool)]
+    prevalence = (
+        float((unique_reference[MbdKey.each_true] <= STABILITY_THRESHOLD).mean())
+        if subset
+        else metric_functions.wbm_uniq_proto_prevalence()
+    )
+    scores = metric_functions.calc_discovery_metrics(
+        metric_reference, predictions, uniq_proto_prevalence=prevalence
+    )
+    metrics = {
+        "selected_set" if subset and key == TestSubset.full_test_set else str(key): {
+            name: float(value) if math.isfinite(float(value)) else None
+            for name, value in values.items()
+        }
+        for key, values in scores.items()
+    }
+    report = {
+        "scope": "wbm-selected" if subset else "wbm-full",
+        "n_expected": len(ids),
+        "n_present": int(artifacts.predictions[DISCOVERY_PRED_COL].notna().sum()),
+        "n_missing": int(artifacts.predictions[DISCOVERY_PRED_COL].isna().sum()),
+        "n_masked_after_cleaning": int(predictions.isna().sum()),
+        "n_converged": sum(record.converged for record in merged_run.records),
+        "n_relaxation_failed": sum(
+            record.error is not None for record in merged_run.records
+        ),
+        "metrics": metrics,
+        "run_metadata": merged_run.run_metadata,
+    }
+    metrics_path = f"{output_dir}/discovery-metrics.json"
+    with atomic_output_path(metrics_path) as temporary:
+        Path(temporary).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    return metrics_path
 
 
 def _repo_relative_path(path: str) -> str:
@@ -228,13 +309,19 @@ def main(raw_args: Sequence[str] | None = None) -> int:
     if model_key is None:
         return 0
     validate_sharded_write_args(parser, args)
-
+    if args.material_ids is not None and args.write_yaml:
+        parser.error("--write-yaml is incompatible with --material-ids")
     if args.print_cmd:
         command = CALCULATORS[model_key].uv_run_cmd(
             "models/run_discovery.py", *_print_cmd_args(args, model_key)
         )
         print(shlex.join(command))
         return 0
+
+    try:
+        selected_ids = read_material_ids(args.material_ids)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
 
     try:
         settings = RelaxationSettings.from_model(
@@ -271,11 +358,20 @@ def main(raw_args: Sequence[str] | None = None) -> int:
         shard_suffix = f"{args.n_shards:03d}" if args.n_shards is not None else "*"
         shard_paths = sorted(glob.glob(f"{shard_dir}/shard-*-of-{shard_suffix}.jsonl"))
         if args.dry_run:
-            expected_material_ids = list(load_wbm_atoms(model_key, dry_run=True))
+            selected_kwargs = (
+                {"material_ids": selected_ids} if selected_ids is not None else {}
+            )
+            expected_material_ids = list(
+                load_wbm_atoms(model_key, dry_run=True, **selected_kwargs)
+            )
         else:
             from matbench_discovery.data import df_wbm
 
-            expected_material_ids = list(map(str, df_wbm.index))
+            expected_material_ids = (
+                selected_ids
+                if selected_ids is not None
+                else list(map(str, df_wbm.index))
+            )
         try:
             merged_run = merge_discovery_shards(
                 shard_paths,
@@ -313,6 +409,13 @@ def main(raw_args: Sequence[str] | None = None) -> int:
         )
         print(f"Wrote relaxed structures to {artifacts.geo_opt_file_path}")
         print(f"Wrote run provenance to {artifacts.run_info_path}")
+        metrics_path = write_local_metrics(
+            artifacts,
+            merged_run,
+            out_dir,
+            subset=args.material_ids is not None or args.dry_run,
+        )
+        print(f"Wrote discovery metrics to {metrics_path}")
         if args.write_yaml:
             if model is None:
                 print(f"Skipping YAML write: {model_key!r} is not a Model")
@@ -334,7 +437,10 @@ def main(raw_args: Sequence[str] | None = None) -> int:
             print("Skipping redundant dry run outside the first Slurm array task")
             return 0
         n_shards, shard_index = slurm_shard_selection(n_shards_arg, shard_index_arg)
-        atoms_by_id = load_wbm_atoms(model_key, dry_run=args.dry_run)
+        selected_kwargs = (
+            {"material_ids": selected_ids} if selected_ids is not None else {}
+        )
+        atoms_by_id = load_wbm_atoms(model_key, dry_run=args.dry_run, **selected_kwargs)
         shard_assignments = partition_material_ids(atoms_by_id, n_shards)
     except ValueError as exc:
         parser.error(str(exc))
@@ -344,9 +450,18 @@ def main(raw_args: Sequence[str] | None = None) -> int:
         material_id: atoms_by_id[material_id] for material_id in assigned_material_ids
     }
     shard_path = f"{shard_dir}/shard-{shard_index:03d}-of-{n_shards:03d}.jsonl"
+    if args.matmul_precision is not None:
+        import torch
+
+        torch.set_float32_matmul_precision(args.matmul_precision)
     calculator, runtime = load_calculator_with_runtime(
-        model_key, device=args.device, dtype=args.dtype
+        model_key,
+        device=args.device,
+        dtype=args.dtype,
+        checkpoint=args.checkpoint,
     )
+    if args.matmul_precision is not None:
+        runtime["matmul_precision"] = args.matmul_precision
     shard = run_discovery_shard(
         calculator=calculator,
         runtime=runtime,

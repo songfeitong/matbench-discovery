@@ -350,7 +350,10 @@ def glob_to_df(
 
 
 def ase_atoms_from_zip(
-    zip_filename: str, *, limit: int | slice | None = None
+    zip_filename: str,
+    *,
+    limit: int | slice | None = None,
+    member_names: Sequence[str] | None = None,
 ) -> list[Atoms]:
     """Read ASE Atoms objects from the .extxyz members of a ZIP file.
 
@@ -359,6 +362,8 @@ def ase_atoms_from_zip(
         limit (int | slice, optional): Maximum number of archive members to read, or
             a slice selecting them by archive order. Defaults to None (all members).
             Use a small number to speed up debugging runs.
+        member_names (Sequence[str], optional): Explicit archive members to read.
+            Selection happens before opening or parsing any member.
 
     Returns:
         list[Atoms]: ASE Atoms objects.
@@ -366,7 +371,7 @@ def ase_atoms_from_zip(
     atoms_list = []
     with zipfile.ZipFile(zip_filename) as zip_file:
         desc = f"Reading ASE Atoms from {zip_filename=}"
-        filenames = zip_file.namelist()
+        filenames = zip_file.namelist() if member_names is None else member_names
         if limit is not None:
             slice_lim = slice(limit) if isinstance(limit, int) else limit
             filenames = filenames[slice_lim]

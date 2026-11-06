@@ -111,14 +111,15 @@ class RelaxationSettings:
         """Load settings from a model YAML and apply explicit overrides.
 
         Raises:
-            ValueError: If model_key is neither a registered model nor the "emt"
-                debug calculator (which has no model YAML).
+            ValueError: If model_key is not a registered model or local calculator.
         """
-        hyperparams = (
-            {}
-            if model_key == "emt"
-            else Model.from_ref(model_key).metadata.get("hyperparams", {})
-        )
+        try:
+            hyperparams = Model.from_ref(model_key).metadata.get("hyperparams", {})
+        except ValueError:
+            from matbench_discovery.calculators import resolve_calculator_key
+
+            resolve_calculator_key(model_key)
+            hyperparams = {}
         if not isinstance(hyperparams, dict):
             raise TypeError(f"{model_key} hyperparams must be a mapping")
         evaluation = hyperparams.get("evaluation", {})
@@ -277,12 +278,27 @@ def load_wbm_atoms(
     model_key: str,
     *,
     dry_run: bool = False,
+    material_ids: Sequence[str] | None = None,
 ) -> dict[str, Atoms]:
     """Load WBM initial structures and optionally select a small smoke-test subset."""
     from matbench_discovery.data import ase_atoms_from_zip, df_wbm
 
-    read_limit = 2048 if dry_run else None
-    atoms_list = ase_atoms_from_zip(DataFiles.wbm_initial_atoms.path, limit=read_limit)
+    expected_ids = list(map(str, df_wbm.index))
+    if material_ids is not None:
+        if not material_ids or len(material_ids) != len(set(material_ids)):
+            raise ValueError("Selected material IDs must be nonempty and unique")
+        if unknown := set(material_ids) - set(expected_ids):
+            raise ValueError(f"Unknown WBM material IDs: {sorted(unknown)}")
+        expected_ids = list(material_ids)
+    read_limit = 2048 if dry_run and material_ids is None else None
+    selection = (
+        {"member_names": [f"{material_id}.extxyz" for material_id in expected_ids]}
+        if material_ids is not None
+        else {}
+    )
+    atoms_list = ase_atoms_from_zip(
+        DataFiles.wbm_initial_atoms.path, limit=read_limit, **selection
+    )
     atoms_by_id: dict[str, Atoms] = {}
     for atoms in atoms_list:
         material_id = material_id_from_atoms(atoms)
@@ -290,7 +306,11 @@ def load_wbm_atoms(
             raise ValueError(f"Duplicate WBM structure {material_id!r}")
         atoms_by_id[material_id] = atoms
 
-    expected_ids = list(map(str, df_wbm.index))
+    if material_ids is not None:
+        selected_id_set = set(material_ids)
+        atoms_by_id = {
+            key: atoms for key, atoms in atoms_by_id.items() if key in selected_id_set
+        }
     if not dry_run:
         missing_ids = set(expected_ids) - set(atoms_by_id)
         extra_ids = set(atoms_by_id) - set(expected_ids)
@@ -533,13 +553,13 @@ def run_discovery_shard(
             for material_id in assigned_material_ids
             if material_id not in completed_ids
         ]
-        if not pending_ids:
-            return existing_shard
         # every segment that wrote records must share the run labels (versions too,
         # so a resume after the env re-resolved fails now, not at the final merge)
         for idx, segment in enumerate(existing_shard.segments):
             if segment.material_ids:
                 check_resume_labels(segment.runtime, runtime, f"{shard_path} {idx=}")
+        if not pending_ids:
+            return existing_shard
 
         reset_gpu_peak_memory(runtime)
         _append_shard_event(

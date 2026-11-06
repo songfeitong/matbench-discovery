@@ -158,6 +158,16 @@ def test_ase_atoms_from_zip_skips_non_extxyz_members(dummy_atoms_zip: Path) -> N
     assert [atoms.get_chemical_formula() for atoms in read_atoms] == ["H2O", "CO2"]
 
 
+def test_ase_atoms_from_zip_selects_before_parsing(dummy_atoms_zip: Path) -> None:
+    """Pilot selections never parse unrelated, potentially expensive members."""
+    with zipfile.ZipFile(dummy_atoms_zip, mode="a") as zip_file:
+        selected = zip_file.namelist()[:1]
+        zip_file.writestr("unselected.extxyz", "malformed extxyz data")
+    atoms = ase_atoms_from_zip(str(dummy_atoms_zip), member_names=selected)
+    assert len(atoms) == 1
+    assert atoms[0].get_chemical_formula() == "H2O"
+
+
 def test_ase_atoms_from_zip_bad_inputs(tmp_path: Path) -> None:
     """Empty zips return []; corrupt zips raise BadZipFile."""
     empty_zip = tmp_path / "empty.zip"

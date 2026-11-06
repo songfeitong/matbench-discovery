@@ -1060,6 +1060,19 @@ def _emt(device: str) -> Calculator:  # noqa: ARG001 - CPU only, debug model
     return EMT()
 
 
+def _prophetv2(device: str, checkpoint: str, dtype: str) -> Calculator:
+    """Load a local Dense/MoE export with its physical normalization intact."""
+    import torch
+    from prophetv2.models import ProphetCalculator, load_mlip
+
+    if dtype != "float32":
+        raise ValueError("ProphetV2 local evaluation requires --dtype float32")
+    mlip = load_mlip(checkpoint, device=device, mixed_precision="no")
+    if next(mlip.parameters()).dtype != torch.float32:
+        raise ValueError("ProphetV2 local evaluation requires float32 export weights")
+    return ProphetCalculator(mlip)
+
+
 # Each model YAML's environment records its submission stack; _runtime_calc_spec
 # layers its calculator packages (CalcSpec.runner_deps) onto the Python 3.14 runner
 # env. Submission-time compatibility notes:
@@ -1211,6 +1224,8 @@ CALCULATORS: _CalcRegistry = _CalcRegistry(
         ),
         # Eager: no Model YAML / environment; do not wrap with _runtime_calc_spec.
         "emt": CalcSpec(_emt),
+        # Private local exports use an explicitly prepared environment and checkpoint.
+        "prophetv2_local": CalcSpec(_prophetv2, requires_checkpoint=True),
     }
 )
 
@@ -1361,6 +1376,8 @@ def load_calculator_with_runtime(
         "n_processes": 1,
         "hostname": socket.gethostname(),
     }
+    if checkpoint is not None:
+        runtime["checkpoint_sha256"] = _stable_file_sha256(checkpoint)[0]
     for env_key in ("SLURM_JOB_ID", "SLURM_ARRAY_TASK_ID"):
         if env_value := os.getenv(env_key):
             runtime[env_key.casefold()] = env_value
